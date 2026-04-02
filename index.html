@@ -12156,21 +12156,75 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
             importBackup(event) {
                 const file = event.target.files[0];
                 if (!file) return;
-                
-                Modal.showConfirm('Isso substituirá todos os dados atuais. Continuar?', () => {
+
+                Modal.showConfirm('Isso substituirá todos os dados atuais no Firebase. Continuar?', () => {
                     const reader = new FileReader();
                     reader.onload = async (e) => {
                         try {
                             const newData = JSON.parse(e.target.result);
+
+                            // 1. Carrega no state
                             Object.assign(state, newData);
-                            await this.saveData();
+
+                            // 2. Garante que todos os itens têm id e _store
+                            const storeId = window._currentStore || 'barueri';
+                            const now = new Date().toISOString();
+                            const colKeys = Object.keys(_COL_MAP);
+
+                            if (!navigator.onLine) {
+                                Toast.show('⚠️ Sem conexão. Conecte-se ao Firebase para restaurar.', 'error', 5000);
+                                return;
+                            }
+
+                            Toast.show('☁️ Enviando backup ao Firebase...', 'info', 3000);
+
+                            let total = 0;
+
+                            // 3. Grava cada coleção no Firestore (em lotes de 500 docs)
+                            for (const stateKey of colKeys) {
+                                const items = (state[stateKey] || []).filter(i => i && i.id);
+                                if (!items.length) continue;
+                                const col = _COL_MAP[stateKey];
+                                // Lotes de 499 (limite Firestore = 500 ops/batch)
+                                for (let i = 0; i < items.length; i += 499) {
+                                    const batch = db.batch();
+                                    items.slice(i, i + 499).forEach(item => {
+                                        if (!item.updated_at) item.updated_at = now;
+                                        batch.set(
+                                            storeDocRef(col, item.id),
+                                            { ...item, _store: storeId, _updatedAt: firebase.firestore.FieldValue.serverTimestamp() },
+                                            { merge: true }
+                                        );
+                                        total++;
+                                    });
+                                    await batch.commit();
+                                }
+                            }
+
+                            // 4. Grava config da empresa
+                            await LocalFirst.pushConfig();
+
+                            // 5. Grava contas financeiras se existirem no backup
+                            const contasBackup = newData._contasManuais || newData.contasFinanceiras || newData._contasFinanceiras || [];
+                            if (Array.isArray(contasBackup) && contasBackup.length > 0) {
+                                await ContasManager.saveAll(contasBackup);
+                            }
+
+                            // 6. Atualiza UI
                             Config.load();
                             Utils.updatePixKey();
                             this.updateSupplierSelect();
                             this.updateCompanyDisplay();
-                            Toast.show('Dados importados com sucesso!');
+                            try { Dashboard.update().catch(()=>{}); } catch(e) {}
+                            try { Clients.renderTable(); } catch(e) {}
+                            try { Products.renderTable(); } catch(e) {}
+                            try { Sales.renderHistory(); } catch(e) {}
+                            try { Expenses.renderTable(); Expenses.updateSummary(); } catch(e) {}
+
+                            Toast.show(`✅ Backup restaurado! ${total} registros gravados no Firebase.`, 'success', 5000);
                         } catch (err) {
-                            Toast.show('Arquivo inválido', 'error');
+                            console.error('[importBackup]', err);
+                            Toast.show('❌ Erro ao restaurar: ' + err.message, 'error');
                         }
                     };
                     reader.readAsText(file);
