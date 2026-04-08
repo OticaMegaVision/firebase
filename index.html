@@ -9262,8 +9262,16 @@ service cloud.firestore {
             get _supabaseId() { return 'contas_financeiras_' + (window._currentStore || 'barueri'); },
 
             async getAll() {
+                // PRIORIDADE 1: usa cache do onSnapshot (atualizado em tempo real, sem delay de rede)
+                const cached = IDB._cache[this._storeKey];
+                if (cached) {
+                    try {
+                        const parsed = typeof cached === 'string' ? JSON.parse(cached) : cached;
+                        if (Array.isArray(parsed) && parsed.length >= 0) return parsed;
+                    } catch(e) {}
+                }
+                // PRIORIDADE 2: busca no Firestore apenas se cache vazio (primeiro acesso)
                 try {
-                    // Firestore: lê doc de contas financeiras da loja
                     const docSnap = await configDocRef('contas_financeiras').get();
                     if (docSnap.exists) {
                         const data = docSnap.data();
@@ -9271,11 +9279,6 @@ service cloud.firestore {
                         IDB._cache[this._storeKey] = JSON.stringify(contas);
                         return contas;
                     }
-                    // Fallback: cache em memória
-                    const raw = IDB._cache[this._storeKey];
-                    if (!raw) return [];
-                    if (typeof raw === 'string') return JSON.parse(raw);
-                    if (Array.isArray(raw)) return raw;
                     return [];
                 } catch(e) { return []; }
             },
@@ -12491,8 +12494,19 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
             },
 
             async update() {
-                // Renderiza imediatamente com dados já disponíveis (estado atual)
-                // para que Vendas e Despesas apareçam ao mesmo tempo sem esperar Firestore
+                // Sincroniza _contasManuais do cache (onSnapshot já mantém IDB._cache atualizado)
+                // sem await bloqueante — usa só o que está em memória para renderizar imediatamente
+                if (typeof ContasManager !== 'undefined') {
+                    try {
+                        const cached = IDB._cache[ContasManager._storeKey];
+                        if (cached) {
+                            const contas = typeof cached === 'string' ? JSON.parse(cached) : cached;
+                            state._contasManuais = Array.isArray(contas) ? contas : [];
+                        }
+                    } catch(e) {}
+                }
+
+                // Renderiza tudo de uma vez — Vendas e Despesas simultaneamente
                 this.updateCards();
                 this.updateSalesChart();
                 this.updateProductsChart();
@@ -12501,14 +12515,12 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                 this.updateGlassesAlerts();
                 this._restoreHideValues();
 
-                // Atualiza contas financeiras em background e re-renderiza os cards
-                // quando os dados do Firestore chegarem (para incluir _contasManuais)
+                // Em background: sincroniza ContasManager (renderiza tabelas, etc.)
+                // e re-renderiza cards só se _contasManuais mudou
                 if (typeof ContasManager !== 'undefined') {
-                    try {
-                        await ContasManager.renderAll();
-                        // Re-renderiza apenas os cards (agora com _contasManuais atualizado)
+                    ContasManager.renderAll().then(() => {
                         this.updateCards();
-                    } catch(e) {}
+                    }).catch(() => {});
                 }
             },
 
@@ -12999,14 +13011,10 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                 const searchTerm = (document.getElementById('filterRecentClient')?.value || '').toLowerCase();
                 const statusFilter = document.getElementById('filterRecentStatus')?.value || '';
                 
-                // Ordena por número da O.S (desc) — extrai parte numérica final para comparação correta
-                const _osNum = s => parseInt((s.number || '').replace(/\D/g, '').slice(-4) || '0', 10);
-                let sales = [...(state.sales || [])]
-                    .sort((a, b) => {
-                        const dateDiff = new Date(b.date + 'T12:00:00') - new Date(a.date + 'T12:00:00');
-                        if (dateDiff !== 0) return dateDiff;
-                        return _osNum(b) - _osNum(a); // desempate por número da OS desc
-                    });
+                // Ordena SOMENTE pelo número sequencial da O.S (decrescente)
+                // Formato: OS-2026-0044 → extrai o número final; funciona com qualquer qtd de dígitos
+                const _osSeq = s => { const m = (s.number || '').match(/(\d+)$/); return m ? parseInt(m[1], 10) : 0; };
+                let sales = [...(state.sales || [])].sort((a, b) => _osSeq(b) - _osSeq(a));
                 if (searchTerm || statusFilter) {
                     sales = sales.filter(s => {
                         const clientName = (state.clients.find(c => c.id === s.clientId)?.name || '').toLowerCase();
