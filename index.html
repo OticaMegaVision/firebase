@@ -9019,16 +9019,66 @@ service cloud.firestore {
             return db.collection('lojas').doc(window._currentStore || 'barueri').collection('config').doc(docId);
         }
 
-        // ── IDB shim: mantém API legacy — agora usa apenas memória ─────────
-        // Cloud-only: persistência = Firestore. IDB usado só para preferências leves.
-        const IDB = {
-            _cache: {},
-            async get(key)        { return Promise.resolve(this._cache[key] ?? null); },
-            async set(key, value) { this._cache[key] = value; return Promise.resolve(); },
-            async remove(key)     { delete this._cache[key]; return Promise.resolve(); },
-            async keys()          { return Promise.resolve(Object.keys(this._cache)); },
-            observe()             { return { unsubscribe: () => {} }; }
-        };
+        // ── IDB: IndexedDB real — persiste entre reloads e logouts ──────────
+        const IDB = (() => {
+            const DB_NAME    = 'oticavision_idb';
+            const STORE_NAME = 'kv';
+            const DB_VER     = 1;
+            let _db = null;
+
+            function _open() {
+                if (_db) return Promise.resolve(_db);
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open(DB_NAME, DB_VER);
+                    req.onupgradeneeded = e => {
+                        const db = e.target.result;
+                        if (!db.objectStoreNames.contains(STORE_NAME))
+                            db.createObjectStore(STORE_NAME);
+                    };
+                    req.onsuccess = e => { _db = e.target.result; resolve(_db); };
+                    req.onerror   = e => reject(e.target.error);
+                });
+            }
+
+            function _tx(mode) {
+                return _open().then(db => db.transaction(STORE_NAME, mode).objectStore(STORE_NAME));
+            }
+
+            function _req(idbReq) {
+                return new Promise((resolve, reject) => {
+                    idbReq.onsuccess = e => resolve(e.target.result);
+                    idbReq.onerror   = e => reject(e.target.error);
+                });
+            }
+
+            return {
+                _cache: {},   // mantido por compatibilidade (leituras in-memory imediatas)
+                async get(key) {
+                    if (this._cache[key] !== undefined) return this._cache[key] ?? null;
+                    try {
+                        const store = await _tx('readonly');
+                        const val   = await _req(store.get(key));
+                        if (val !== undefined) this._cache[key] = val;
+                        return val ?? null;
+                    } catch(e) { return this._cache[key] ?? null; }
+                },
+                async set(key, value) {
+                    this._cache[key] = value;
+                    try { const store = await _tx('readwrite'); await _req(store.put(value, key)); } catch(e) {}
+                },
+                async remove(key) {
+                    delete this._cache[key];
+                    try { const store = await _tx('readwrite'); await _req(store.delete(key)); } catch(e) {}
+                },
+                async keys() {
+                    try {
+                        const store = await _tx('readonly');
+                        return await _req(store.getAllKeys());
+                    } catch(e) { return Object.keys(this._cache); }
+                },
+                observe() { return { unsubscribe: () => {} }; }
+            };
+        })();
 
         // ── Mapa de coleções Firestore ──────────────────────────────────────
         const _COL_MAP = {
@@ -9091,6 +9141,8 @@ service cloud.firestore {
                         if (cfg.lastOsCounter) state.lastOsCounter = { ...state.lastOsCounter, ...cfg.lastOsCounter };
                         if (state.company.primaryColor)   document.documentElement.style.setProperty('--primary', state.company.primaryColor);
                         if (state.company.secondaryColor) document.documentElement.style.setProperty('--secondary', state.company.secondaryColor);
+                        // Persiste no IndexedDB para que login screen carregue logo/nome após reload
+                        IDB.set('ovp_company', JSON.stringify(state.company)).catch(() => {});
                         try { App.updateCompanyDisplay(); } catch(e) {}
                         try { if (typeof Config !== 'undefined' && !Config._dirty) Config.load(); } catch(e) {}
                         Dashboard.update().catch(()=>{});
@@ -12153,6 +12205,55 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                 Toast.show('Backup gerado com sucesso!');
             },
 
+            async _compressBackupImages(data) {
+                const LIMIT = 1048487;
+                // Compress a single base64 image string to under LIMIT bytes
+                const compressImage = (b64str) => new Promise((resolve) => {
+                    const prefix = b64str.includes(',') ? b64str.split(',')[0] + ',' : 'data:image/jpeg;base64,';
+                    const raw = b64str.includes(',') ? b64str.split(',')[1] : b64str;
+                    const img = new Image();
+                    img.onload = () => {
+                        let w = img.width, h = img.height;
+                        // Scale down to max 1024px on longest side
+                        if (w > 1024 || h > 1024) {
+                            const ratio = Math.min(1024 / w, 1024 / h);
+                            w = Math.round(w * ratio);
+                            h = Math.round(h * ratio);
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w; canvas.height = h;
+                        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                        // Try reducing quality until under limit
+                        let quality = 0.85;
+                        let result;
+                        do {
+                            result = canvas.toDataURL('image/jpeg', quality);
+                            quality -= 0.1;
+                        } while (result.length > LIMIT && quality > 0.1);
+                        resolve(result);
+                    };
+                    img.onerror = () => resolve(b64str); // keep original if error
+                    img.src = prefix + raw;
+                });
+
+                let compressed = 0;
+                // Walk all arrays in data looking for .image fields
+                for (const key of Object.keys(data)) {
+                    if (Array.isArray(data[key])) {
+                        for (const item of data[key]) {
+                            if (item && typeof item.image === 'string' && item.image.length > LIMIT) {
+                                item.image = await compressImage(item.image);
+                                compressed++;
+                            }
+                        }
+                    }
+                }
+                if (compressed > 0) {
+                    Toast.show(`🗜️ ${compressed} imagem(ns) comprimida(s) automaticamente.`, 'info', 3000);
+                }
+                return data;
+            },
+
             importBackup(event) {
                 const file = event.target.files[0];
                 if (!file) return;
@@ -12161,7 +12262,11 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                     const reader = new FileReader();
                     reader.onload = async (e) => {
                         try {
-                            const newData = JSON.parse(e.target.result);
+                            let newData = JSON.parse(e.target.result);
+
+                            // 0. Comprime imagens que excedam o limite do Firestore (1 MB)
+                            Toast.show('🗜️ Verificando imagens do backup...', 'info', 2000);
+                            newData = await this._compressBackupImages(newData);
 
                             // 1. Carrega no state
                             Object.assign(state, newData);
@@ -12180,6 +12285,9 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
 
                             let total = 0;
 
+                            // Para listeners onSnapshot — evita que sobrescrevam o state importado
+                            LocalFirst._stopListeners();
+                            try {
                             // 3. Grava cada coleção no Firestore (em lotes de 500 docs)
                             for (const stateKey of colKeys) {
                                 const items = (state[stateKey] || []).filter(i => i && i.id);
@@ -12203,6 +12311,8 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
 
                             // 4. Grava config da empresa
                             await LocalFirst.pushConfig();
+                            // Persiste empresa no IDB para a tela de login
+                            IDB.set('ovp_company', JSON.stringify(state.company)).catch(() => {});
 
                             // 5. Grava contas financeiras se existirem no backup
                             const contasBackup = newData._contasManuais || newData.contasFinanceiras || newData._contasFinanceiras || [];
@@ -12210,7 +12320,7 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                                 await ContasManager.saveAll(contasBackup);
                             }
 
-                            // 6. Atualiza UI
+                            // 6. Atualiza UI com os dados já no state (importados)
                             Config.load();
                             Utils.updatePixKey();
                             this.updateSupplierSelect();
@@ -12222,6 +12332,11 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                             try { Expenses.renderTable(); Expenses.updateSummary(); } catch(e) {}
 
                             Toast.show(`✅ Backup restaurado! ${total} registros gravados no Firebase.`, 'success', 5000);
+
+                            } finally {
+                                // Relliga listeners após UI atualizada
+                                LocalFirst._startListeners(storeId);
+                            }
                         } catch (err) {
                             console.error('[importBackup]', err);
                             Toast.show('❌ Erro ao restaurar: ' + err.message, 'error');
@@ -15465,6 +15580,8 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                 
                 App.saveData();
                 App.updateCompanyDisplay();
+                // Persiste empresa no IndexedDB para login screen
+                IDB.set('ovp_company', JSON.stringify(state.company)).catch(() => {});
                 document.documentElement.style.setProperty('--primary', state.company.primaryColor);
                 document.documentElement.style.setProperty('--secondary', state.company.secondaryColor);
 
@@ -15668,6 +15785,8 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                         state.company.logo = e.target.result;
                         App.saveData();
                         App.updateCompanyDisplay();
+                        // Persiste empresa no IndexedDB para login screen
+                        IDB.set('ovp_company', JSON.stringify(state.company)).catch(() => {});
                         SupaSync.upsertConfig().catch(() => {});
                         Toast.show('Logo atualizada com sucesso!');
                     };
@@ -22398,7 +22517,7 @@ const AuthSystem = {
                 if (loginWrap) loginWrap.style.background = 'linear-gradient(135deg,#ff6b00,#e55a00)';
             }
 
-            // Nome da empresa
+            // Nome da empresa — state → DOM
             const nameFromState = (typeof state !== 'undefined' && state.company && state.company.name)
                 ? state.company.name : null;
             const nameFromDOM   = document.getElementById('companyName')?.textContent?.trim();
@@ -22577,15 +22696,14 @@ const AuthSystem = {
         const session = this._getSession();
         if (!session) {
             await this._ensureDefaultUsers();
-            // Pré-carrega dados da empresa do IDB antes de mostrar o login
+            // Pré-carrega dados da empresa do IndexedDB antes de mostrar o login
             // para que logo e nome já estejam disponíveis no card de login
             try {
-                const saved = await IDB.get(STORAGE_KEY());
+                const saved = await IDB.get('ovp_company');
                 if (saved) {
                     const parsed = JSON.parse(saved);
-                    if (parsed && parsed.company) {
-                        // Atualiza state.company sem sobrescrever o state inteiro
-                        Object.assign(state.company, parsed.company);
+                    if (parsed && typeof parsed === 'object') {
+                        Object.assign(state.company, parsed);
                     }
                 }
             } catch(e) {}
