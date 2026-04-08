@@ -12491,11 +12491,8 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
             },
 
             async update() {
-                // FIX: renderAll() popula state._contasManuais (contas a pagar baixadas)
-                // antes de updateCards() calcular totalExpenses via _filteredExpenses()
-                if (typeof ContasManager !== 'undefined') {
-                    try { await ContasManager.renderAll(); } catch(e) {}
-                }
+                // Renderiza imediatamente com dados já disponíveis (estado atual)
+                // para que Vendas e Despesas apareçam ao mesmo tempo sem esperar Firestore
                 this.updateCards();
                 this.updateSalesChart();
                 this.updateProductsChart();
@@ -12503,6 +12500,16 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                 this.updateBirthdayAlerts();
                 this.updateGlassesAlerts();
                 this._restoreHideValues();
+
+                // Atualiza contas financeiras em background e re-renderiza os cards
+                // quando os dados do Firestore chegarem (para incluir _contasManuais)
+                if (typeof ContasManager !== 'undefined') {
+                    try {
+                        await ContasManager.renderAll();
+                        // Re-renderiza apenas os cards (agora com _contasManuais atualizado)
+                        this.updateCards();
+                    } catch(e) {}
+                }
             },
 
             setPeriod(period, btn) {
@@ -12992,8 +12999,14 @@ tbody tr td{border:1.5px solid #000;padding:2mm;text-align:center;font-weight:70
                 const searchTerm = (document.getElementById('filterRecentClient')?.value || '').toLowerCase();
                 const statusFilter = document.getElementById('filterRecentStatus')?.value || '';
                 
+                // Ordena por número da O.S (desc) — extrai parte numérica final para comparação correta
+                const _osNum = s => parseInt((s.number || '').replace(/\D/g, '').slice(-4) || '0', 10);
                 let sales = [...(state.sales || [])]
-                    .sort((a, b) => new Date(b.date + 'T12:00:00') - new Date(a.date + 'T12:00:00'));
+                    .sort((a, b) => {
+                        const dateDiff = new Date(b.date + 'T12:00:00') - new Date(a.date + 'T12:00:00');
+                        if (dateDiff !== 0) return dateDiff;
+                        return _osNum(b) - _osNum(a); // desempate por número da OS desc
+                    });
                 if (searchTerm || statusFilter) {
                     sales = sales.filter(s => {
                         const clientName = (state.clients.find(c => c.id === s.clientId)?.name || '').toLowerCase();
